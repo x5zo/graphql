@@ -31,10 +31,6 @@ async function callGraphQL(token: string, query: string, variables: any = {}) {
   return json.data;
 }
 
-function uniq<T>(arr: T[]) {
-  return Array.from(new Set(arr));
-}
-
 // ----------------------------
 // MAIN /api/stats
 // ----------------------------
@@ -43,81 +39,42 @@ router.get("/", async (req, res) => {
     const token = req.cookies?.jwt;
     if (!token) return res.status(401).json({ error: "Missing JWT cookie" });
 
-    // use env event id (fallback 763)
-    const eventId = Number(process.env.REBOOT_EVENT_ID || 763);
-
     // =========================
-    // A) PROFILE (name + ratio + XP)
+    // A) PROFILE (name + audit ratio)
     // =========================
     const PROFILE_QUERY = `
-      query Profile($eventId: Int!) {
+      query Profile {
         user {
           login
           auditRatio
           firstName
           lastName
-          xps(
-            where: {
-              _or: [
-                { originEventId: { _eq: $eventId } }
-                {
-                  path: {
-                    _like: "/bahrain/bh-module/piscine-%"
-                    _nlike: "/bahrain/bh-module/piscine-%/%"
-                  }
-                }
-              ]
-            }
-          ) {
-            amount
-            path
-          }
         }
       }
     `;
 
-    const profileData = await callGraphQL(token, PROFILE_QUERY, { eventId });
-    const user = profileData?.user?.[0];
-
-    if (!user) {
-      return res.status(404).json({ error: "User not found in GraphQL response" });
-    }
-
-    // total XP (sum of xps)
-    const totalXP = (user.xps ?? []).reduce(
-      (sum: number, x: any) => sum + Number(x?.amount || 0),
-      0
-    );
+    // =========================
+    // B) XP from transaction table (per project instructions)
+    //    Filter to /bahrain/bh-module/ paths only — depth-3 paths are top-level projects
+    // =========================
+    const XP_QUERY = `
+      query XP {
+        transaction(
+          where: {
+            type: { _eq: "xp" }
+            path: { _like: "/bahrain/bh-module/%" }
+          }
+          order_by: { createdAt: asc }
+        ) {
+          amount
+          path
+          objectId
+        }
+      }
+    `;
 
     // =========================
-    // B) XP BY PROJECT (from xps.path)
-    // =========================
-    // We will group by the last part of the path (project slug)
-    // Example path: /bahrain/bh-module/lem-in  => "lem-in"
-    const xpMap = new Map<string, number>();
-
-    for (const x of user.xps ?? []) {
-      const path: string = x?.path || "";
-      const amount = Number(x?.amount || 0);
-
-      if (!path) continue;
-
-      // try to extract the "last segment"
-      const parts = path.split("/").filter(Boolean);
-      const slug = parts[parts.length - 1] || "unknown";
-
-      // ignore weird ones if needed
-      if (!slug) continue;
-
-      xpMap.set(slug, (xpMap.get(slug) ?? 0) + amount);
-    }
-
-    const xpByProject = Array.from(xpMap.entries())
-      .map(([project, xp]) => ({ project, xp }))
-      .sort((a, b) => b.xp - a.xp);
-
-    // =========================
-    // C) PASS/FAIL ratio (projects)
+    // C) PASS/FAIL ratio (result table, project objects)
     // =========================
     const PASSFAIL_QUERY = `
       query PassFail {
@@ -131,10 +88,75 @@ router.get("/", async (req, res) => {
       }
     `;
 
-    const pfData = await callGraphQL(token, PASSFAIL_QUERY);
-    const results: any[] = pfData?.result ?? [];
+    // =========================
+    // D) Audit done/received amounts
+    // =========================
+    const AUDIT_QUERY = `
+      query AuditAmounts {
+        up: transaction_aggregate(where: { type: { _eq: "up" } }) {
+          aggregate { sum { amount } }
+        }
+        down: transaction_aggregate(where: { type: { _eq: "down" } }) {
+          aggregate { sum { amount } }
+        }
+      }
+    `;
 
-    // Some projects may appear multiple times; keep unique project name
+    // Run all queries in parallel
+    const [profileData, xpData, pfData, auditData] = await Promise.all([
+      callGraphQL(token, PROFILE_QUERY),
+      callGraphQL(token, XP_QUERY),
+      callGraphQL(token, PASSFAIL_QUERY),
+      callGraphQL(token, AUDIT_QUERY),
+    ]);
+
+    const user = profileData?.user?.[0];
+    if (!user) {
+      return res.status(404).json({ error: "User not found in GraphQL response" });
+    }
+
+    // =========================
+    // Process XP transactions
+    // Sum ALL depth-3 transactions: /bahrain/bh-module/<project>
+    // No deduplication — zone01 grants XP once per project
+    // =========================
+    // Total XP: depth-3 projects + depth-4 checkpoint items under /bahrain/bh-module/
+    // Chart XP: depth-3 only (top-level projects for the bar chart)
+    let totalXPRaw = 0;
+    const xpMap = new Map<string, number>(); // for chart (depth-3 only)
+
+    for (const tx of xpData?.transaction ?? []) {
+      const path: string = tx?.path || "";
+      const amount = Number(tx?.amount || 0);
+      if (!path || !amount) continue;
+
+      const parts = path.split("/").filter(Boolean);
+
+      // depth-3: top-level project — count in total AND chart
+      if (parts.length === 3) {
+        totalXPRaw += amount;
+        const slug = parts[2];
+        xpMap.set(slug, (xpMap.get(slug) ?? 0) + amount);
+      }
+      // depth-4: checkpoint exercises under bh-module — count in total only
+      else if (parts.length === 4) {
+        totalXPRaw += amount;
+      }
+      // depth-5+: piscine-js sub-exercises — skip (already counted via piscine-js root at depth-3)
+    }
+
+    const xpByProject = Array.from(xpMap.entries())
+      .map(([project, xp]) => ({ project, xp }))
+      .sort((a, b) => b.xp - a.xp);
+
+    const totalXP = totalXPRaw;
+
+    // =========================
+    // Process pass/fail
+    // grade >= 1 = pass (100%), below = fail
+    // Deduplicate by project name (keep last result)
+    // =========================
+    const results: any[] = pfData?.result ?? [];
     const seen = new Set<string>();
     let pass = 0;
     let fail = 0;
@@ -146,7 +168,7 @@ router.get("/", async (req, res) => {
       seen.add(name);
 
       const grade = Number(r?.grade || 0);
-      if (grade > 0) pass++;
+      if (grade >= 1) pass++;
       else fail++;
     }
 
@@ -160,19 +182,8 @@ router.get("/", async (req, res) => {
     };
 
     // =========================
-    // D) Audit ratio + done/received amounts
+    // Process audit amounts
     // =========================
-    const AUDIT_AMOUNTS_QUERY = `
-      query AuditAmounts {
-        up: transaction_aggregate(where: { type: { _eq: "up" } }) {
-          aggregate { sum { amount } }
-        }
-        down: transaction_aggregate(where: { type: { _eq: "down" } }) {
-          aggregate { sum { amount } }
-        }
-      }
-    `;
-    const auditData = await callGraphQL(token, AUDIT_AMOUNTS_QUERY);
     const done     = auditData?.up?.aggregate?.sum?.amount   ?? 0;
     const received = auditData?.down?.aggregate?.sum?.amount ?? 0;
 
@@ -182,12 +193,11 @@ router.get("/", async (req, res) => {
       received: Number(received),
     };
 
-    // Return final JSON
     return res.json({
       me: {
-        login: user.login ?? null,
+        login:     user.login     ?? null,
         firstName: user.firstName ?? null,
-        lastName: user.lastName ?? null,
+        lastName:  user.lastName  ?? null,
       },
       totalXP,
       audit,

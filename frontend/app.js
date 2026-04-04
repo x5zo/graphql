@@ -97,9 +97,8 @@ async function loadStats() {
   setText("qsFirstName", me.firstName ?? "—");
   setText("qsLastName",  me.lastName  ?? "—");
 
-  // Animated XP
-  const totalXP = Array.isArray(stats.xpByProject)
-    ? stats.xpByProject.reduce((s, x) => s + Number(x.xp || 0), 0) : 0;
+  // Animated XP — use server-computed totalXP (includes checkpoint items)
+  const totalXP = Number(stats.totalXP || 0);
   const xpEl = $("qsXP");
   if (xpEl) animateCount(xpEl, 0, totalXP, 1400, v => formatXP(Math.round(v)));
 
