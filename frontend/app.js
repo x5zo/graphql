@@ -1,5 +1,5 @@
 // @ts-nocheck
-const API_BASE = "http://localhost:4000";
+const API_BASE = "https://graphql-y4uy.onrender.com";
 const $ = (id) => document.getElementById(id);
 
 const loginView      = $("loginView");
